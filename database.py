@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "crosslister.db"
 
-VALID_CARD_TYPES = ("Pokemon", "Sports", "MTG", "YuGiOh", "HotWheels", "Other")
+VALID_CARD_TYPES = ("Pokemon", "OnePiece", "Lorcana", "Sports", "MTG", "YuGiOh", "HotWheels", "Other")
 VALID_STATUSES = ("pending", "active", "sold", "deleted", "error")
 
 
@@ -26,6 +26,8 @@ def init_db():
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 filename        TEXT NOT NULL,
                 image_path      TEXT,
+                front_photo     TEXT,
+                back_photo      TEXT,
                 title           TEXT,
                 card_name       TEXT,
                 card_number     TEXT,
@@ -51,7 +53,12 @@ def init_db():
         for col in ("status", "mercari_id", "depop_id", "ebay_id"):
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON items({col})")
         # Migrate existing databases that predate these columns
-        for col, definition in (("brand", "TEXT"), ("year", "TEXT DEFAULT 'unknown'")):
+        for col, definition in (
+            ("brand",       "TEXT"),
+            ("year",        "TEXT DEFAULT 'unknown'"),
+            ("front_photo", "TEXT"),
+            ("back_photo",  "TEXT"),
+        ):
             try:
                 conn.execute(f"ALTER TABLE items ADD COLUMN {col} {definition}")
                 logger.info("Migration: added column '%s'", col)
@@ -67,11 +74,11 @@ def insert_item(data: dict) -> int:
     with get_connection() as conn:
         cur = conn.execute("""
             INSERT INTO items
-                (filename, image_path, title, card_name, card_number, set_name,
-                 rarity, brand, year, card_type, condition, asking_price, status, date_listed)
+                (filename, image_path, front_photo, back_photo, title, card_name, card_number,
+                 set_name, rarity, brand, year, card_type, condition, asking_price, status, date_listed)
             VALUES
-                (:filename, :image_path, :title, :card_name, :card_number, :set_name,
-                 :rarity, :brand, :year, :card_type, :condition, :asking_price, :status, :date_listed)
+                (:filename, :image_path, :front_photo, :back_photo, :title, :card_name, :card_number,
+                 :set_name, :rarity, :brand, :year, :card_type, :condition, :asking_price, :status, :date_listed)
         """, data)
         conn.commit()
         logger.info("Inserted item id=%d  file=%s", cur.lastrowid, data.get("filename"))

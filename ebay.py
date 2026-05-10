@@ -85,7 +85,7 @@ def _do_ebay_listing(page, item, image_path: str) -> str | None:
     logger.info("Listing '%s' on eBay at $%.2f", item["title"], item["asking_price"])
 
     # Start with keyword-based listing flow
-    page.goto(EBAY_SELL_URL, wait_until="networkidle", timeout=30000)
+    page.goto(EBAY_SELL_URL, wait_until="domcontentloaded", timeout=60000)
     _human_delay(2, 4)
 
     # Enter keywords to help eBay find the right category

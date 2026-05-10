@@ -2,7 +2,7 @@
 
 Automated reseller tool that identifies trading cards and collectibles from photos, prices them using real eBay data, and lists them on Mercari, Depop, and eBay — automatically.
 
-Works for: **Pokemon, Sports Cards, MTG, Yu-Gi-Oh, Hot Wheels, and any collectible.**
+Works for: **Pokemon, One Piece, Lorcana, Sports Cards, MTG, Yu-Gi-Oh, and any collectible.**
 
 ---
 
@@ -127,12 +127,50 @@ python report.py --csv
 
 ---
 
-## Photo Tips
+## Photo Naming — Important
+
+CrossLister uses the filename to decide how to identify and price each card.
+
+### Sports Cards (need front AND back photos)
+
+Sports cards require two photos named with `_Front` and `_Back` suffixes.  
+The base name before the suffix must match exactly.
+
+**Examples:**
+```
+MichaelJordan_Front.jpg   ← front of the card
+MichaelJordan_Back.jpg    ← back of the same card (matched automatically)
+
+TomBrady_Front.jpg
+TomBrady_Back.jpg
+
+Jeter1996_Front.png
+Jeter1996_Back.png
+```
+
+CrossLister will pass both images to the AI so it can read the year from the copyright line on the back, the card number, and confirm it's a rookie card.
+
+> If a `_Front` file has no matching `_Back`, it will still be processed but year and card number may be less accurate.
+
+### TCG Cards — Pokemon, One Piece, Lorcana, MTG, Yu-Gi-Oh (single photo)
+
+TCG cards only need one photo. Use any descriptive filename — **do not include `_Front` or `_Back`** in the name.
+
+**Examples:**
+```
+Charizard.jpg
+Luffy_OP01001.jpg
+Mickey_Lorcana.png
+BlackLotus.jpg
+BlueeEyesWhiteDragon.jpg
+```
+
+### Tips
 
 - One card per photo
 - Lay the card flat on a plain background
-- Good lighting — no glare
-- Capture the full card including edges
+- Good lighting — no glare on holos
+- Capture the full card including all four edges
 - Supported formats: JPG, PNG, WEBP, BMP, TIFF
 
 ---
@@ -191,7 +229,7 @@ CrossLister calculates prices from real eBay data:
 | card_number | Number (e.g. 4/102) |
 | set_name | Set or series name |
 | rarity | Holo Rare, Common, etc. |
-| card_type | Pokemon, Sports, MTG, YuGiOh, HotWheels, Other |
+| card_type | Pokemon, OnePiece, Lorcana, Sports, MTG, YuGiOh, HotWheels, Other |
 | condition | Near Mint, Lightly Played, etc. |
 | mercari_id | Mercari listing ID |
 | depop_id | Depop listing ID |

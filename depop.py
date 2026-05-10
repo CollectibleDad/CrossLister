@@ -2,45 +2,49 @@
 Playwright automation for Depop listings.
 Connects to existing Chrome on port 9222.
 Fixed price: $2.00 on Depop (best for quick turnover on lower-value cards).
+Browser automation ported from the proven list_cards_depop.py.
 """
+import asyncio
 import logging
 import re
 import time
-import random
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, Page
 
 import database as db
 
 logger = logging.getLogger(__name__)
 
 CDP_URL = "http://localhost:9222"
-DEPOP_SELL_URL = "https://www.depop.com/sell/"
-DEPOP_FIXED_PRICE = 2.00
-
-CONDITION_MAP = {
-    "Mint": "New with tags",
-    "Near Mint": "New without tags",
-    "Lightly Played": "Like new",
-    "Moderately Played": "Good",
-    "Heavily Played": "Fair",
-    "Poor": "Poor",
-}
+DEPOP_CREATE_URL = "https://www.depop.com/products/create/"
+DEPOP_FIXED_PRICE = "2"
+SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
 
 
-def _human_delay(lo=0.8, hi=2.2):
-    time.sleep(lo + (hi - lo) * random.random())
-
-
-def _type_human(element, text: str):
-    element.click()
-    _human_delay(0.2, 0.5)
-    element.fill(text)
-    _human_delay(0.3, 0.8)
-
+# ── Public API (sync wrappers so main.py needs no changes) ─────────────────────
 
 def list_on_depop(item_id: int) -> str | None:
+    return asyncio.run(_list_on_depop_async(item_id))
+
+
+def delete_depop_listing(depop_id: str) -> bool:
+    return asyncio.run(_delete_depop_listing_async(depop_id))
+
+
+# ── Internal async implementation ──────────────────────────────────────────────
+
+async def _save_error_screenshot(page, label: str):
+    try:
+        SCREENSHOT_DIR.mkdir(exist_ok=True)
+        path = SCREENSHOT_DIR / f"depop_{label}_{int(time.time())}.png"
+        await page.screenshot(path=str(path), full_page=True)
+        logger.info("Screenshot saved: %s", path)
+    except Exception as e:
+        logger.warning("Could not save screenshot: %s", e)
+
+
+async def _list_on_depop_async(item_id: int) -> str | None:
     item = db.get_item_by_id(item_id)
     if not item:
         logger.error("Item %d not found", item_id)
@@ -51,173 +55,432 @@ def list_on_depop(item_id: int) -> str | None:
         logger.error("Image not found for item %d: %s", item_id, image_path)
         return None
 
-    with sync_playwright() as p:
+    async with async_playwright() as p:
         try:
-            browser = p.chromium.connect_over_cdp(CDP_URL)
+            browser = await p.chromium.connect_over_cdp(CDP_URL)
         except Exception as e:
             logger.error("Cannot connect to Chrome on port 9222: %s", e)
             return None
 
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.new_page()
+        ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
         try:
-            return _do_depop_listing(page, item, image_path)
-        except PWTimeout as e:
-            logger.error("Timeout during Depop listing for item %d: %s", item_id, e)
-            return None
+            submitted = await _do_depop_listing(page, item, image_path)
         except Exception as e:
             logger.error("Error listing item %d on Depop: %s", item_id, e)
+            await _save_error_screenshot(page, f"error_{item_id}")
             return None
-        finally:
-            page.close()
 
-
-def _do_depop_listing(page, item, image_path: str) -> str | None:
-    logger.info("Listing '%s' on Depop at $%.2f", item["title"], DEPOP_FIXED_PRICE)
-    page.goto(DEPOP_SELL_URL, wait_until="networkidle", timeout=30000)
-    _human_delay(2, 4)
-
-    _upload_photo(page, image_path)
-    _fill_title(page, item)
-    _fill_description(page, item)
-    _select_category(page, item)
-    _select_condition(page, item["condition"])
-    _fill_price(page)
-    _human_delay(1, 2)
-    _submit_listing(page)
-
-    depop_id = _extract_listing_id(page)
-    if depop_id:
+    if submitted:
+        depop_id = _extract_listing_id(page.url) or f"DEPOP_{int(time.time())}"
         db.update_item(item["id"], {"depop_id": depop_id, "status": "active"})
         logger.info("Depop listing created: %s", depop_id)
+        return depop_id
+
+    logger.warning("Depop listing not confirmed submitted for item %d", item_id)
+    return None
+
+
+async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
+    logger.info("Listing '%s' on Depop at $%s", item["title"], DEPOP_FIXED_PRICE)
+    title = item["title"][:60]
+
+    # Navigate to create form with retry until the form is actually loaded
+    for attempt in range(4):
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        try:
+            await page.goto(DEPOP_CREATE_URL, wait_until="domcontentloaded", timeout=90000)
+        except Exception as e:
+            logger.warning("goto /create/ attempt %d: %s", attempt + 1, e)
+            await asyncio.sleep(4)
+            continue
+        await asyncio.sleep(3)
+
+        on_form = await page.evaluate(
+            """() => !!(
+                document.querySelector('input[type="file"]') ||
+                document.querySelector('input[accept*="image"]') ||
+                document.querySelector('[data-testid*="photo"]') ||
+                document.querySelector('[data-testid*="upload"]') ||
+                (document.title && document.title.toLowerCase().includes('sell'))
+            )"""
+        )
+        if on_form:
+            break
+        logger.warning("Create form not detected (attempt %d) — URL: %s", attempt + 1, page.url)
+        try:
+            sell_btn = page.locator("a:has-text('Sell now'), button:has-text('Sell now')").first
+            if await sell_btn.is_visible(timeout=3000):
+                await sell_btn.click()
+                await asyncio.sleep(3)
+        except Exception:
+            pass
+
+    # Dismiss any onboarding modals
+    for _ in range(3):
+        dismissed = False
+        for loc in [
+            page.locator('button[aria-label="Close"], button[aria-label="close"]'),
+            page.locator('button:has-text("×"), button:has-text("✕")'),
+            page.locator('[role="dialog"] button').last,
+        ]:
+            try:
+                el = loc.first
+                if await el.is_visible(timeout=1500):
+                    await el.click()
+                    await asyncio.sleep(1)
+                    dismissed = True
+                    break
+            except Exception:
+                pass
+        if not dismissed:
+            break
+
+    # ── Photo ─────────────────────────────────────────────────────────────────
+    uploaded = False
+    for sel in [
+        'button:has-text("Add a photo")',
+        'button:has-text("Add photos")',
+        '[aria-label*="Add a photo" i]',
+        '[aria-label*="Add photo" i]',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=4000):
+                async with page.expect_file_chooser(timeout=5000) as fc_info:
+                    await btn.click()
+                fc = await fc_info.value
+                await fc.set_files(image_path)
+                await asyncio.sleep(4)
+                uploaded = True
+                logger.info("Photo uploaded via button.")
+                break
+        except Exception:
+            pass
+
+    if not uploaded:
+        for sel in ['input[type="file"]', 'input[accept*="image"]']:
+            try:
+                fi = page.locator(sel).first
+                if await fi.count() > 0:
+                    await fi.set_input_files(image_path)
+                    await asyncio.sleep(4)
+                    uploaded = True
+                    logger.info("Photo uploaded via hidden input.")
+                    break
+            except Exception:
+                pass
+
+    if not uploaded:
+        logger.warning("Could not upload photo to Depop")
+
+    # ── Title / Item name ─────────────────────────────────────────────────────
+    filled = False
+    for attempt in [
+        lambda: page.get_by_label(re.compile(r"^name$", re.I)),
+        lambda: page.get_by_label(re.compile(r"item name", re.I)),
+        lambda: page.get_by_label(re.compile(r"title", re.I)),
+        lambda: page.locator('input[name="name"]'),
+        lambda: page.locator('input[name="productName"]'),
+        lambda: page.locator('[data-testid="product-name-input"]'),
+        lambda: page.locator('[data-testid="title-input"]'),
+        lambda: page.locator('input[placeholder*="name" i]'),
+        lambda: page.locator('input[placeholder*="title" i]'),
+        lambda: page.locator('input[placeholder*="item" i]'),
+        lambda: page.locator(
+            'main input:not([type="file"]):not([type="hidden"]):not([type="number"])'
+            ':not([type="submit"]):not([type="checkbox"]):not([type="radio"]):not([type="search"])'
+        ),
+        lambda: page.locator(
+            'form input:not([type="file"]):not([type="hidden"]):not([type="number"])'
+            ':not([type="submit"]):not([type="checkbox"]):not([type="radio"]):not([type="search"])'
+        ),
+    ]:
+        try:
+            el = attempt().first
+            if await el.is_visible(timeout=3000):
+                await el.click()
+                await el.fill(title)
+                filled = True
+                break
+        except Exception:
+            pass
+    if not filled:
+        logger.warning("Could not fill Depop title")
     else:
-        logger.warning("Could not extract Depop ID from URL: %s", page.url)
-    return depop_id
+        logger.info("Title filled.")
 
+    # ── Description ───────────────────────────────────────────────────────────
+    desc = _build_description(item)
+    filled = False
+    for attempt in [
+        lambda: page.get_by_label(re.compile(r"description", re.I)),
+        lambda: page.locator('textarea[name="description"]'),
+        lambda: page.locator('textarea[placeholder*="description" i]'),
+        lambda: page.locator('textarea[placeholder*="describe" i]'),
+        lambda: page.locator('[data-testid="product-description-input"]'),
+        lambda: page.locator('[data-testid="description-input"]'),
+        lambda: page.locator('[aria-label*="description" i]'),
+        lambda: page.locator('textarea'),
+    ]:
+        try:
+            el = attempt().first
+            if await el.is_visible(timeout=3000):
+                await el.click()
+                await el.fill(desc)
+                filled = True
+                break
+        except Exception:
+            pass
+    if not filled:
+        logger.warning("Could not fill Depop description")
 
-def _upload_photo(page, image_path: str):
+    # ── Category ──────────────────────────────────────────────────────────────
     try:
-        file_input = page.locator("input[type='file']").first
-        if file_input.is_visible():
-            file_input.set_input_files(image_path)
+        await _select_category(page)
+    except Exception as e:
+        logger.warning("Category: %s", e)
+
+    # ── Condition ─────────────────────────────────────────────────────────────
+    try:
+        await _select_condition(page)
+    except Exception as e:
+        logger.warning("Condition: %s", e)
+
+    # ── Price ─────────────────────────────────────────────────────────────────
+    filled = False
+    for attempt in [
+        lambda: page.get_by_label(re.compile(r"price", re.I)),
+        lambda: page.locator('input[name="price"]'),
+        lambda: page.locator('[data-testid="price-input"]'),
+        lambda: page.locator('input[placeholder="0.00"]'),
+        lambda: page.locator('input[placeholder*="0.00"]'),
+        lambda: page.locator('[aria-label*="price" i]'),
+        lambda: page.locator('input[type="number"]'),
+    ]:
+        try:
+            el = attempt().first
+            if await el.is_visible(timeout=3000):
+                await el.click()
+                await el.fill(DEPOP_FIXED_PRICE)
+                filled = True
+                break
+        except Exception:
+            pass
+    if not filled:
+        logger.warning("Could not fill Depop price")
+
+    await asyncio.sleep(1)
+
+    # ── Shipping — pick smallest package size ─────────────────────────────────
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(1)
+        selected = False
+        for size_text in ["Extra Small", "Small", "XS", "S", "Letter", "Envelope"]:
+            pattern = re.compile(re.escape(size_text), re.I)
+            for loc in [
+                page.locator("button").filter(has_text=pattern),
+                page.locator("[role='radio']").filter(has_text=pattern),
+                page.locator("[role='button']").filter(has_text=pattern),
+                page.locator("label").filter(has_text=pattern),
+                page.locator("li").filter(has_text=pattern),
+            ]:
+                try:
+                    el = loc.first
+                    if await el.is_visible(timeout=1500):
+                        await el.click()
+                        await asyncio.sleep(0.5)
+                        selected = True
+                        logger.info("Package size: %s", size_text)
+                        break
+                except Exception:
+                    pass
+            if selected:
+                break
+        if not selected:
+            # Coordinate-based fallback
+            for term in ["Extra Small", "Small", "XS"]:
+                if await _click_by_text(page, term):
+                    selected = True
+                    logger.info("Package size set via coordinates: %s", term)
+                    break
+    except Exception as e:
+        logger.warning("Shipping: %s", e)
+
+    await asyncio.sleep(1)
+
+    # ── Submit ────────────────────────────────────────────────────────────────
+    # Dismiss any modal that reappeared
+    for loc in [
+        page.locator('button[aria-label="Close"], button[aria-label="close"]'),
+        page.locator('[role="dialog"] button').last,
+    ]:
+        try:
+            el = loc.first
+            if await el.is_visible(timeout=1500):
+                await el.click()
+                await asyncio.sleep(0.5)
+                break
+        except Exception:
+            pass
+
+    await page.evaluate("window.scrollTo(0, 0)")
+    await asyncio.sleep(0.5)
+
+    # JS DOM click on the 'Post' button (proven to work with React synthetic events)
+    clicked = await page.evaluate(
+        """() => {
+            const btn = Array.from(document.querySelectorAll('button'))
+                .find(b => b.textContent.trim() === 'Post' && !b.disabled);
+            if (!btn) return 'not_found';
+            btn.scrollIntoView({block: 'center'});
+            btn.click();
+            return 'clicked';
+        }"""
+    )
+    logger.info("Post button DOM click: %s", clicked)
+
+    submitted = False
+    if clicked == "clicked":
+        await asyncio.sleep(6)
+        content = await page.content()
+        if "listed" in content.lower() or "/create/" not in page.url:
+            submitted = True
+            logger.info("Depop listing submitted.")
         else:
-            with page.expect_file_chooser() as fc_info:
-                page.locator(
-                    "button:has-text('Add photo'), label:has-text('Add photo'), "
-                    "div[data-testid*='photo']"
-                ).first.click()
-            fc_info.value.set_files(image_path)
-        _human_delay(2, 4)
-    except Exception as e:
-        logger.warning("Depop photo upload issue: %s", e)
+            logger.warning("DOM click fired but success page not detected")
+    else:
+        logger.warning("Post button not found on page")
+
+    # Dismiss post-submit modal
+    for txt in ["Done", "OK", "Got it", "Close", "Continue selling"]:
+        try:
+            btn = page.locator(f'button:has-text("{txt}")').first
+            if await btn.is_visible(timeout=2000):
+                await btn.click()
+                await asyncio.sleep(1)
+                break
+        except Exception:
+            pass
+
+    return submitted
 
 
-def _fill_title(page, item):
-    try:
-        title = item["title"][:75]
-        field = page.locator(
-            "input[name='title'], input[placeholder*='title' i], "
-            "input[data-testid*='title' i]"
-        ).first
-        _type_human(field, title)
-    except Exception as e:
-        logger.warning("Title fill issue: %s", e)
+async def _click_by_text(page: Page, search: str) -> bool:
+    """Find the smallest visible element containing search text and mouse-click it."""
+    coords = await page.evaluate(
+        """([search]) => {
+            const lower = search.toLowerCase();
+            const candidates = Array.from(document.querySelectorAll('*'))
+                .filter(el => {
+                    if (!el.textContent.toLowerCase().includes(lower)) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && r.width < 600 && r.height < 200;
+                })
+                .sort((a, b) => a.textContent.trim().length - b.textContent.trim().length);
+            if (candidates.length === 0) return null;
+            const r = candidates[0].getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }""",
+        [search],
+    )
+    if coords:
+        await page.mouse.click(coords["x"], coords["y"])
+        await asyncio.sleep(1)
+        return True
+    return False
 
 
-def _fill_description(page, item):
-    desc_parts = [
-        f"{item['card_name']} - {item['condition']}",
-    ]
-    if item["set_name"]:
-        desc_parts.append(f"Set: {item['set_name']}")
-    if item["card_number"]:
-        desc_parts.append(f"Card #: {item['card_number']}")
-    if item["rarity"]:
-        desc_parts.append(f"Rarity: {item['rarity']}")
-    desc_parts += ["", "Ships in protective sleeve. Fast shipping!"]
-    desc = "\n".join(desc_parts)
-    try:
-        field = page.locator(
-            "textarea[name='description'], textarea[placeholder*='description' i], "
-            "div[contenteditable='true']"
-        ).first
-        _type_human(field, desc)
-    except Exception as e:
-        logger.warning("Description fill issue: %s", e)
+async def _select_category(page: Page):
+    """Click the 'Trading cards' category chip on the Depop create form."""
+    await asyncio.sleep(4)  # wait for Depop to analyse description and show suggestion
+    pattern = re.compile(r"trading cards", re.I)
+
+    for loc in [
+        page.locator("button").filter(has_text=pattern),
+        page.locator("[role='button']").filter(has_text=pattern),
+        page.locator("li").filter(has_text=pattern),
+        page.locator("a").filter(has_text=pattern),
+        page.locator("p").filter(has_text=pattern),
+    ]:
+        try:
+            el = loc.first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                await asyncio.sleep(1)
+                logger.info("Category chip clicked.")
+                return
+        except Exception:
+            pass
+
+    for term in ["Trading cards", "Everything else / Trading cards"]:
+        if await _click_by_text(page, term):
+            logger.info("Category chip clicked via coordinates.")
+            return
+
+    logger.warning("Could not click Depop category suggestion")
 
 
-def _select_category(page, item):
-    card_type = item["card_type"]
-    keywords = {
-        "Pokemon": "Trading Cards",
-        "MTG": "Trading Cards",
-        "YuGiOh": "Trading Cards",
-        "Sports": "Sports",
-        "HotWheels": "Toys",
-        "Other": "Collectibles",
-    }
-    keyword = keywords.get(card_type, "Collectibles")
-    try:
-        cat_btn = page.locator(
-            "button:has-text('Category'), select[name='category'], "
-            "div[data-testid*='category']"
-        ).first
-        if cat_btn.is_visible(timeout=3000):
-            cat_btn.click()
-            _human_delay(0.8, 1.5)
-            option = page.locator(f"*:has-text('{keyword}')").first
-            if option.is_visible(timeout=3000):
-                option.click()
-    except Exception as e:
-        logger.warning("Category selection issue: %s", e)
+async def _select_condition(page: Page):
+    """Open the condition picker and select 'Like new'."""
+    for loc in [
+        page.get_by_role("button", name=re.compile(r"condition", re.I)),
+        page.locator("button").filter(has_text=re.compile(r"^condition$", re.I)),
+        page.get_by_label(re.compile(r"condition", re.I)),
+    ]:
+        try:
+            el = loc.first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                await asyncio.sleep(1)
+                break
+        except Exception:
+            pass
+
+    pattern = re.compile(r"like new", re.I)
+    for loc in [
+        page.locator("button").filter(has_text=pattern),
+        page.locator("[role='button']").filter(has_text=pattern),
+        page.locator("[role='radio']").filter(has_text=pattern),
+        page.locator("label").filter(has_text=pattern),
+        page.locator("li").filter(has_text=pattern),
+        page.locator("p").filter(has_text=pattern),
+    ]:
+        try:
+            el = loc.first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                await asyncio.sleep(0.5)
+                logger.info("Condition set to Like new.")
+                return
+        except Exception:
+            pass
+
+    if await _click_by_text(page, "Like new"):
+        logger.info("Condition set via coordinates.")
+        return
+
+    logger.warning("Could not set Depop condition")
 
 
-def _select_condition(page, condition: str):
-    depop_condition = CONDITION_MAP.get(condition, "Like new")
-    try:
-        cond_area = page.locator(
-            "select[name='condition'], div[data-testid*='condition'], "
-            f"label:has-text('Condition')"
-        ).first
-        if cond_area.is_visible(timeout=3000):
-            cond_area.click()
-            _human_delay(0.5, 1)
-            opt = page.locator(
-                f"option:has-text('{depop_condition}'), "
-                f"li:has-text('{depop_condition}')"
-            ).first
-            if opt.is_visible(timeout=2000):
-                opt.click()
-    except Exception as e:
-        logger.warning("Condition selection issue: %s", e)
+def _build_description(item: dict) -> str:
+    parts = [f"{item['card_name']} - {item['condition']}"]
+    if item.get("set_name"):
+        parts.append(f"Set: {item['set_name']}")
+    if item.get("card_number"):
+        parts.append(f"Card #: {item['card_number']}")
+    if item.get("rarity"):
+        parts.append(f"Rarity: {item['rarity']}")
+    parts += ["", "Ships in protective sleeve. Fast shipping!"]
+    return "\n".join(parts)
 
 
-def _fill_price(page):
-    try:
-        price_field = page.locator(
-            "input[name='price'], input[placeholder*='price' i], "
-            "input[data-testid*='price']"
-        ).first
-        _type_human(price_field, f"{DEPOP_FIXED_PRICE:.2f}")
-    except Exception as e:
-        logger.warning("Price fill issue: %s", e)
-
-
-def _submit_listing(page):
-    try:
-        btn = page.locator(
-            "button:has-text('List'), button:has-text('Sell'), "
-            "button[type='submit']:has-text('List')"
-        ).first
-        btn.click()
-        _human_delay(3, 6)
-    except Exception as e:
-        logger.warning("Submit issue: %s", e)
-
-
-def _extract_listing_id(page) -> str | None:
-    url = page.url
+def _extract_listing_id(url: str) -> str | None:
     patterns = [
         r"depop\.com/products/([A-Za-z0-9_-]+)",
         r"/([A-Za-z0-9]{8,})/?\s*$",
@@ -229,34 +492,31 @@ def _extract_listing_id(page) -> str | None:
     return None
 
 
-def delete_depop_listing(depop_id: str) -> bool:
-    with sync_playwright() as p:
+async def _delete_depop_listing_async(depop_id: str) -> bool:
+    async with async_playwright() as p:
         try:
-            browser = p.chromium.connect_over_cdp(CDP_URL)
+            browser = await p.chromium.connect_over_cdp(CDP_URL)
         except Exception as e:
             logger.error("Cannot connect to Chrome: %s", e)
             return False
 
-        context = browser.contexts[0]
-        page = context.new_page()
+        ctx = browser.contexts[0]
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         try:
             url = f"https://www.depop.com/products/{depop_id}/"
-            page.goto(url, timeout=20000)
-            _human_delay(2, 3)
+            await page.goto(url, timeout=90000)
+            await asyncio.sleep(2)
             delete_btn = page.locator(
-                "button:has-text('Delete'), a:has-text('Delete'), "
-                "button[aria-label*='delete' i]"
+                "button:has-text('Delete'), a:has-text('Delete'), button[aria-label*='delete' i]"
             ).first
-            delete_btn.click()
-            _human_delay(1, 2)
+            await delete_btn.click()
+            await asyncio.sleep(1)
             confirm = page.locator("button:has-text('Yes'), button:has-text('Delete item')").first
-            if confirm.is_visible(timeout=3000):
-                confirm.click()
-            _human_delay(2, 3)
+            if await confirm.is_visible(timeout=90000):
+                await confirm.click()
+            await asyncio.sleep(2)
             logger.info("Deleted Depop listing: %s", depop_id)
             return True
         except Exception as e:
             logger.error("Failed to delete Depop listing %s: %s", depop_id, e)
             return False
-        finally:
-            page.close()
