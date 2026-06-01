@@ -7,19 +7,31 @@ Browser automation ported from the proven list_cards_depop.py.
 import asyncio
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 
 from playwright.async_api import async_playwright, Page
 
 import database as db
+import failure_handler
+
+_UTILS = Path(__file__).resolve().parent / "scripts" / "utils"
+if str(_UTILS) not in sys.path:
+    sys.path.insert(0, str(_UTILS))
+from session_manager import ensure_depop_alive, ensure_browser_alive, is_browser_dead_error
 
 logger = logging.getLogger(__name__)
 
 CDP_URL = "http://localhost:9222"
 DEPOP_CREATE_URL = "https://www.depop.com/products/create/"
 DEPOP_FIXED_PRICE = "2"
-SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
+
+LONG_RUN_MODE = False       # Set True by launcher for large/overnight batches
+_MAX_RECOVERY_ATTEMPTS = 2  # Extra listing attempts after browser recovery
+_GOTO_TIMEOUT_MS = 90_000
+
+_MODAL_TEXT = "Help buyers discover your items"
 
 
 # ── Public API (sync wrappers so main.py needs no changes) ─────────────────────
@@ -34,16 +46,6 @@ def delete_depop_listing(depop_id: str) -> bool:
 
 # ── Internal async implementation ──────────────────────────────────────────────
 
-async def _save_error_screenshot(page, label: str):
-    try:
-        SCREENSHOT_DIR.mkdir(exist_ok=True)
-        path = SCREENSHOT_DIR / f"depop_{label}_{int(time.time())}.png"
-        await page.screenshot(path=str(path), full_page=True)
-        logger.info("Screenshot saved: %s", path)
-    except Exception as e:
-        logger.warning("Could not save screenshot: %s", e)
-
-
 async def _list_on_depop_async(item_id: int) -> str | None:
     item = db.get_item_by_id(item_id)
     if not item:
@@ -55,25 +57,70 @@ async def _list_on_depop_async(item_id: int) -> str | None:
         logger.error("Image not found for item %d: %s", item_id, image_path)
         return None
 
+    submitted = False
+    final_url = ""
+    recovery_count = 0
+
     async with async_playwright() as p:
-        try:
-            browser = await p.chromium.connect_over_cdp(CDP_URL)
-        except Exception as e:
-            logger.error("Cannot connect to Chrome on port 9222: %s", e)
+        session = await ensure_depop_alive(p)
+        if not session:
             return None
 
-        ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        for attempt in range(1, _MAX_RECOVERY_ATTEMPTS + 2):
+            # Proactive alive check catches deaths that occurred between card listings
+            live = await ensure_browser_alive(p, session)
+            if not live:
+                logger.error("[BROWSER RECOVERY] Cannot recover browser — aborting item %d", item_id)
+                return None
+            session = live
 
-        try:
-            submitted = await _do_depop_listing(page, item, image_path)
-        except Exception as e:
-            logger.error("Error listing item %d on Depop: %s", item_id, e)
-            await _save_error_screenshot(page, f"error_{item_id}")
-            return None
+            try:
+                submitted = await _do_depop_listing(session.page, item, image_path)
+                try:
+                    final_url = session.page.url
+                except Exception:
+                    pass
+                break
+            except Exception as e:
+                if is_browser_dead_error(e) and recovery_count < _MAX_RECOVERY_ATTEMPTS:
+                    recovery_count += 1
+                    print(
+                        f"[BROWSER RECOVERY] Browser/context died during listing "
+                        f"(recovery {recovery_count}/{_MAX_RECOVERY_ATTEMPTS}) — {e}"
+                    )
+                    logger.warning(
+                        "[BROWSER RECOVERY] Dead browser on item %d attempt %d: %s",
+                        item_id, attempt, e,
+                    )
+                    session = await ensure_browser_alive(p, session)
+                    if not session:
+                        logger.error(
+                            "[BROWSER RECOVERY] Unrecoverable — aborting item %d", item_id
+                        )
+                        return None
+                    print(f"[PAGE RESTART] Restarting Depop listing for item {item_id} (attempt {attempt + 1})")
+                    logger.info("[PAGE RESTART] Re-entering _do_depop_listing for item %d", item_id)
+                    await asyncio.sleep(2)
+                    continue
+                logger.error("Error listing item %d on Depop: %s", item_id, e)
+                try:
+                    await failure_handler.save_failure_screenshot(
+                        session.page, "depop", item.get("card_name", "")
+                    )
+                except Exception:
+                    pass
+                return None
+
+        if not submitted:
+            try:
+                await failure_handler.save_failure_screenshot(
+                    session.page, "depop", item.get("card_name", "")
+                )
+            except Exception:
+                pass
 
     if submitted:
-        depop_id = _extract_listing_id(page.url) or f"DEPOP_{int(time.time())}"
+        depop_id = _extract_listing_id(final_url) or f"DEPOP_{int(time.time())}"
         db.update_item(item["id"], {"depop_id": depop_id, "status": "active"})
         logger.info("Depop listing created: %s", depop_id)
         return depop_id
@@ -85,16 +132,20 @@ async def _list_on_depop_async(item_id: int) -> str | None:
 async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
     logger.info("Listing '%s' on Depop at $%s", item["title"], DEPOP_FIXED_PRICE)
     title = item["title"][:60]
+    _goto_timeout = 180_000 if LONG_RUN_MODE else _GOTO_TIMEOUT_MS
+    _idle_timeout = 15_000 if LONG_RUN_MODE else 8_000
 
     # Navigate to create form with retry until the form is actually loaded
     for attempt in range(4):
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.wait_for_load_state("networkidle", timeout=_idle_timeout)
         except Exception:
             pass
         try:
-            await page.goto(DEPOP_CREATE_URL, wait_until="domcontentloaded", timeout=90000)
+            await page.goto(DEPOP_CREATE_URL, wait_until="domcontentloaded", timeout=_goto_timeout)
         except Exception as e:
+            if is_browser_dead_error(e):
+                raise  # Propagate so outer recovery loop can handle it
             logger.warning("goto /create/ attempt %d: %s", attempt + 1, e)
             await asyncio.sleep(4)
             continue
@@ -120,27 +171,8 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
         except Exception:
             pass
 
-    # Dismiss any onboarding modals
-    for _ in range(3):
-        dismissed = False
-        for loc in [
-            page.locator('button[aria-label="Close"], button[aria-label="close"]'),
-            page.locator('button:has-text("×"), button:has-text("✕")'),
-            page.locator('[role="dialog"] button').last,
-        ]:
-            try:
-                el = loc.first
-                if await el.is_visible(timeout=1500):
-                    await el.click()
-                    await asyncio.sleep(1)
-                    dismissed = True
-                    break
-            except Exception:
-                pass
-        if not dismissed:
-            break
-
     # ── Photo ─────────────────────────────────────────────────────────────────
+    await close_blocking_modals(page)
     uploaded = False
     for sel in [
         'button:has-text("Add a photo")',
@@ -178,7 +210,14 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
     if not uploaded:
         logger.warning("Could not upload photo to Depop")
 
+    # Give Depop time to auto-detect details from the uploaded photo
+    print("[DEPOP AUTO-DETECT WAIT]")
+    logger.info("[DEPOP AUTO-DETECT WAIT] 5 s for Depop auto-detect after photo upload")
+    await asyncio.sleep(5)
+    await close_blocking_modals(page)
+
     # ── Title / Item name ─────────────────────────────────────────────────────
+    await close_blocking_modals(page)
     filled = False
     for attempt in [
         lambda: page.get_by_label(re.compile(r"^name$", re.I)),
@@ -215,6 +254,7 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
         logger.info("Title filled.")
 
     # ── Description ───────────────────────────────────────────────────────────
+    await close_blocking_modals(page)
     desc = _build_description(item)
     filled = False
     for attempt in [
@@ -239,19 +279,35 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
     if not filled:
         logger.warning("Could not fill Depop description")
 
+    # Give Depop time to auto-detect category/brand from the description
+    print("[DEPOP AUTO-DETECT WAIT]")
+    logger.info("[DEPOP AUTO-DETECT WAIT] 4 s for Depop auto-detect after description")
+    await asyncio.sleep(4)
+    await close_blocking_modals(page)
+
     # ── Category ──────────────────────────────────────────────────────────────
+    await close_blocking_modals(page)
     try:
         await _select_category(page)
     except Exception as e:
         logger.warning("Category: %s", e)
 
+    # ── Brand ─────────────────────────────────────────────────────────────────
+    await close_blocking_modals(page)
+    try:
+        await _fill_brand(page)
+    except Exception as e:
+        logger.warning("Brand: %s", e)
+
     # ── Condition ─────────────────────────────────────────────────────────────
+    await close_blocking_modals(page)
     try:
         await _select_condition(page)
     except Exception as e:
         logger.warning("Condition: %s", e)
 
     # ── Price ─────────────────────────────────────────────────────────────────
+    await close_blocking_modals(page)
     filled = False
     for attempt in [
         lambda: page.get_by_label(re.compile(r"price", re.I)),
@@ -295,6 +351,7 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
                     if await el.is_visible(timeout=1500):
                         await el.click()
                         await asyncio.sleep(0.5)
+                        await close_blocking_modals(page)
                         selected = True
                         logger.info("Package size: %s", size_text)
                         break
@@ -306,6 +363,7 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
             # Coordinate-based fallback
             for term in ["Extra Small", "Small", "XS"]:
                 if await _click_by_text(page, term):
+                    await close_blocking_modals(page)
                     selected = True
                     logger.info("Package size set via coordinates: %s", term)
                     break
@@ -315,19 +373,7 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
     await asyncio.sleep(1)
 
     # ── Submit ────────────────────────────────────────────────────────────────
-    # Dismiss any modal that reappeared
-    for loc in [
-        page.locator('button[aria-label="Close"], button[aria-label="close"]'),
-        page.locator('[role="dialog"] button').last,
-    ]:
-        try:
-            el = loc.first
-            if await el.is_visible(timeout=1500):
-                await el.click()
-                await asyncio.sleep(0.5)
-                break
-        except Exception:
-            pass
+    await close_blocking_modals(page)
 
     await page.evaluate("window.scrollTo(0, 0)")
     await asyncio.sleep(0.5)
@@ -371,6 +417,93 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
     return submitted
 
 
+async def close_blocking_modals(page: Page) -> bool:
+    """
+    Detect and close the 'Help buyers discover your items' popup and any other
+    blocking dialog.  Returns True when clear to proceed.  If the modal cannot
+    be dismissed, saves a screenshot and returns False.
+    """
+    # Check for the specific blocking popup by text content
+    try:
+        modal_visible = await page.evaluate(
+            """(text) => Array.from(document.querySelectorAll('*')).some(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && el.textContent.includes(text);
+            })""",
+            _MODAL_TEXT,
+        )
+    except Exception:
+        modal_visible = False
+
+    # Also catch any generic dialog/alertdialog that may be blocking
+    if not modal_visible:
+        for loc in [
+            page.locator('[role="dialog"]'),
+            page.locator('[role="alertdialog"]'),
+        ]:
+            try:
+                if await loc.first.is_visible(timeout=400):
+                    modal_visible = True
+                    break
+            except Exception:
+                pass
+
+    if not modal_visible:
+        return True
+
+    logger.info("Blocking modal detected — attempting to close.")
+
+    # Close by clicking the X button (preferred) or any dialog close button
+    closed = False
+    for sel in [
+        '[role="dialog"] button[aria-label="Close"]',
+        '[role="dialog"] button[aria-label="close"]',
+        '[role="alertdialog"] button[aria-label="Close"]',
+        'button[aria-label="Close"]',
+        'button[aria-label="close"]',
+        'button:has-text("×")',
+        'button:has-text("✕")',
+        '[role="dialog"] button',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=800):
+                await btn.click()
+                await asyncio.sleep(1)
+                closed = True
+                logger.info("Closed blocking modal via selector: %s", sel)
+                break
+        except Exception:
+            pass
+
+    if not closed:
+        for sym in ["×", "✕"]:
+            if await _click_by_text(page, sym):
+                closed = True
+                await asyncio.sleep(1)
+                logger.info("Closed blocking modal via text symbol: %s", sym)
+                break
+
+    # Verify the specific popup text is gone
+    try:
+        still_visible = await page.evaluate(
+            """(text) => Array.from(document.querySelectorAll('*')).some(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && el.textContent.includes(text);
+            })""",
+            _MODAL_TEXT,
+        )
+    except Exception:
+        still_visible = False
+
+    if still_visible:
+        logger.warning("'%s' modal persists after close attempt", _MODAL_TEXT)
+        await failure_handler.save_failure_screenshot(page, "depop_modal", "blocking_modal")
+        return False
+
+    return True
+
+
 async def _click_by_text(page: Page, search: str) -> bool:
     """Find the smallest visible element containing search text and mouse-click it."""
     coords = await page.evaluate(
@@ -397,8 +530,38 @@ async def _click_by_text(page: Page, search: str) -> bool:
 
 
 async def _select_category(page: Page):
-    """Click the 'Trading cards' category chip on the Depop create form."""
+    """Click the 'Trading cards' category chip — skip if already selected."""
+    await close_blocking_modals(page)
+
+    # Check if Depop already auto-selected the category
+    try:
+        already_selected = await page.evaluate(
+            """() => {
+                const pat = /trading cards/i;
+                return Array.from(document.querySelectorAll(
+                    'button, [role="button"], [role="option"], li, a'
+                )).some(el => {
+                    if (!pat.test(el.textContent.trim())) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    return (
+                        el.getAttribute('aria-selected') === 'true' ||
+                        el.getAttribute('aria-pressed') === 'true' ||
+                        el.getAttribute('data-selected') === 'true' ||
+                        el.classList.contains('selected') ||
+                        el.classList.contains('active')
+                    );
+                });
+            }"""
+        )
+        if already_selected:
+            logger.info("Category already set to Trading cards — skipping.")
+            return
+    except Exception:
+        pass
+
     await asyncio.sleep(4)  # wait for Depop to analyse description and show suggestion
+    await close_blocking_modals(page)
     pattern = re.compile(r"trading cards", re.I)
 
     for loc in [
@@ -413,6 +576,7 @@ async def _select_category(page: Page):
             if await el.is_visible(timeout=2000):
                 await el.click()
                 await asyncio.sleep(1)
+                await close_blocking_modals(page)
                 logger.info("Category chip clicked.")
                 return
         except Exception:
@@ -420,6 +584,7 @@ async def _select_category(page: Page):
 
     for term in ["Trading cards", "Everything else / Trading cards"]:
         if await _click_by_text(page, term):
+            await close_blocking_modals(page)
             logger.info("Category chip clicked via coordinates.")
             return
 
@@ -428,6 +593,7 @@ async def _select_category(page: Page):
 
 async def _select_condition(page: Page):
     """Open the condition picker and select 'Like new'."""
+    await close_blocking_modals(page)
     for loc in [
         page.get_by_role("button", name=re.compile(r"condition", re.I)),
         page.locator("button").filter(has_text=re.compile(r"^condition$", re.I)),
@@ -438,6 +604,8 @@ async def _select_condition(page: Page):
             if await el.is_visible(timeout=2000):
                 await el.click()
                 await asyncio.sleep(1)
+                # Dropdown is now open — clear any modal before selecting
+                await close_blocking_modals(page)
                 break
         except Exception:
             pass
@@ -456,16 +624,62 @@ async def _select_condition(page: Page):
             if await el.is_visible(timeout=2000):
                 await el.click()
                 await asyncio.sleep(0.5)
+                await close_blocking_modals(page)
                 logger.info("Condition set to Like new.")
                 return
         except Exception:
             pass
 
     if await _click_by_text(page, "Like new"):
+        await close_blocking_modals(page)
         logger.info("Condition set via coordinates.")
         return
 
     logger.warning("Could not set Depop condition")
+
+
+async def _fill_brand(page: Page):
+    """Fill the brand field with 'Other' if it is empty (skip if already populated)."""
+    brand_locators = [
+        page.get_by_label(re.compile(r"^brand$", re.I)),
+        page.locator('input[name="brand"]'),
+        page.locator('[data-testid="brand-input"]'),
+        page.locator('[aria-label*="brand" i]'),
+        page.locator('input[placeholder*="brand" i]'),
+    ]
+
+    for loc_fn in brand_locators:
+        try:
+            el = loc_fn if not callable(loc_fn) else loc_fn
+            field = el.first
+            if not await field.is_visible(timeout=2000):
+                continue
+            current_val = await field.input_value()
+            if current_val and current_val.strip():
+                logger.info("Brand already populated (%s) — skipping.", current_val.strip())
+                return
+            await field.click()
+            await field.fill("Other")
+            await asyncio.sleep(0.5)
+            await close_blocking_modals(page)
+            # Accept first autocomplete suggestion if one appears
+            for suggestion_loc in [
+                page.locator('[role="option"]').first,
+                page.locator('[role="listbox"] li').first,
+            ]:
+                try:
+                    if await suggestion_loc.is_visible(timeout=1000):
+                        await suggestion_loc.click()
+                        await asyncio.sleep(0.3)
+                        break
+                except Exception:
+                    pass
+            logger.info("Brand set to Other.")
+            return
+        except Exception:
+            pass
+
+    logger.warning("Could not find or fill Depop brand field")
 
 
 def _build_description(item: dict) -> str:

@@ -25,6 +25,7 @@ import ebay
 import sales_checker
 import sync_manager
 import report
+import failure_handler
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 INPUT_FOLDER   = Path(r"C:\Users\mrozo\OneDrive\Desktop\CardsToList")
@@ -101,6 +102,7 @@ def run_pipeline():
     logger.info("════ CrossLister Starting %s ════", start.strftime("%Y-%m-%d %H:%M:%S"))
 
     db.init_db()
+    failure_handler.ensure_dirs()
 
     # ── STEP 1: Check Sales ─────────────────────────────────────────────────
     step_banner(1, "Checking Sales")
@@ -194,6 +196,12 @@ def run_pipeline():
         "failed": [], "succeeded": []
     }
 
+    source_batch: list[str] = []
+    mercari_processed: list[str] = []
+    depop_processed: list[str] = []
+
+    batch_id = datetime.now().strftime("BATCH_%Y%m%d_%H%M%S")
+
     for image_path, card_info in priced_items:
         item_id = None
         try:
@@ -220,20 +228,30 @@ def run_pipeline():
             continue
 
         listing_stats["attempted"] += 1
+        source_batch.append(image_path.name)
         any_success = False
 
         # ── [1/3] Mercari ─────────────────────────────────────────────────
         logger.info("  [1/3] Starting Mercari — waiting for full completion...")
         mid = None
+        mercari_err = None
         try:
             mid = mercari.list_on_mercari(item_id)
         except Exception as e:
             logger.error("  Mercari raised an exception for item %d: %s", item_id, e)
+            mercari_err = str(e)
         if mid:
             listing_stats["mercari_ok"] += 1
+            mercari_processed.append(image_path.name)
             any_success = True
             logger.info("  [1/3] Mercari complete — listing ID: %s", mid)
         else:
+            _reason = mercari_err or "No listing ID returned"
+            _status = "failed" if mercari_err else "unconfirmed"
+            failure_handler.record_failure(
+                "mercari", image_path, card_info["title"], _reason, batch_id,
+                card_name=card_info.get("card_name", ""), status=_status,
+            )
             logger.warning("  [1/3] Mercari finished without a confirmed listing ID")
 
         logger.info("  Waiting 5s before Depop...")
@@ -242,15 +260,24 @@ def run_pipeline():
         # ── [2/3] Depop ───────────────────────────────────────────────────
         logger.info("  [2/3] Starting Depop — waiting for full completion...")
         did = None
+        depop_err = None
         try:
             did = depop.list_on_depop(item_id)
         except Exception as e:
             logger.error("  Depop raised an exception for item %d: %s", item_id, e)
+            depop_err = str(e)
         if did:
             listing_stats["depop_ok"] += 1
+            depop_processed.append(image_path.name)
             any_success = True
             logger.info("  [2/3] Depop complete — listing ID: %s", did)
         else:
+            _reason = depop_err or "No listing ID returned"
+            _status = "failed" if depop_err else "unconfirmed"
+            failure_handler.record_failure(
+                "depop", image_path, card_info["title"], _reason, batch_id,
+                card_name=card_info.get("card_name", ""), status=_status,
+            )
             logger.warning("  [2/3] Depop finished without a confirmed listing ID")
 
         # ── [3/3] eBay — coming soon ──────────────────────────────────────
@@ -286,6 +313,39 @@ def run_pipeline():
             if back_photo and Path(back_photo).exists():
                 shutil.move(back_photo, str(FAILED_DIR / Path(back_photo).name))
             logger.warning("  All platforms failed — image(s) moved to Failed/")
+
+        logger.info("[BATCH CONTINUING]")
+
+    # ── BATCH RECONCILIATION ────────────────────────────────────────────────
+    source_set  = set(source_batch)
+    mercari_set = set(mercari_processed)
+    depop_set   = set(depop_processed)
+
+    mercari_only        = sorted(mercari_set - source_set)
+    depop_only          = sorted(depop_set   - source_set)
+    missing_from_mercari = sorted(source_set - mercari_set)
+    missing_from_depop   = sorted(source_set - depop_set)
+
+    logger.info("")
+    logger.info("[BATCH RECONCILIATION]")
+    logger.info("  Source count:         %d  %s", len(source_batch),     sorted(source_batch))
+    logger.info("  Mercari listed:       %d  %s", len(mercari_processed), sorted(mercari_processed))
+    logger.info("  Depop listed:         %d  %s", len(depop_processed),   sorted(depop_processed))
+    logger.info("  Mercari only:         %s", mercari_only        or "(none)")
+    logger.info("  Depop only:           %s", depop_only          or "(none)")
+    logger.info("  Missing from Mercari: %s", missing_from_mercari or "(none)")
+    logger.info("  Missing from Depop:   %s", missing_from_depop   or "(none)")
+
+    batch_clean = (
+        len(source_batch) == len(mercari_processed) == len(depop_processed)
+        and not mercari_only and not depop_only
+        and not missing_from_mercari and not missing_from_depop
+    )
+    if not batch_clean:
+        logger.warning("")
+        logger.warning("[RECONCILIATION WARNING] Count mismatch — batch is NOT fully clean.")
+    else:
+        logger.info("  Batch fully clean: all platforms match source count.")
 
     # ── STEP 6: Daily Report ────────────────────────────────────────────────
     step_banner(6, "Generating Daily Report")

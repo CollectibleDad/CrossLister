@@ -128,7 +128,7 @@ def _fill_title(page, item):
             "input[placeholder*='Item title' i], input[data-testid*='title']"
         ).first
         field.wait_for(timeout=10000)
-        field.triple_click()
+        field.click(click_count=3)
         _type_human(field, item["title"][:80])
     except Exception as e:
         logger.warning("eBay title issue: %s", e)
@@ -202,7 +202,7 @@ def _fill_price(page, price: float):
             "input[placeholder*='price' i], input[data-testid*='price']"
         ).first
         if price_field.is_visible(timeout=5000):
-            price_field.triple_click()
+            price_field.click(click_count=3)
             _type_human(price_field, price_str)
     except Exception as e:
         logger.warning("eBay price issue: %s", e)

@@ -7,21 +7,26 @@ Browser automation ported from the proven list_cards.py (data-testid selectors).
 import asyncio
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
 import database as db
+import failure_handler
+
+_UTILS = Path(__file__).resolve().parent / "scripts" / "utils"
+if str(_UTILS) not in sys.path:
+    sys.path.insert(0, str(_UTILS))
+from session_manager import ensure_mercari_alive
 
 logger = logging.getLogger(__name__)
 
 CDP_URL = "http://localhost:9222"
 MERCARI_SELL_URL = "https://www.mercari.com/sell/"
-SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
 FLOOR_PRICE = 1.22
 
-# Maps our condition strings to Mercari's data-testid values
 CONDITION_TESTID_MAP = {
     "Mint":              "ConditionLikeNew",
     "Near Mint":         "ConditionLikeNew",
@@ -44,16 +49,6 @@ def delete_mercari_listing(mercari_id: str) -> bool:
 
 # ── Internal async implementation ──────────────────────────────────────────────
 
-async def _save_error_screenshot(page, label: str):
-    try:
-        SCREENSHOT_DIR.mkdir(exist_ok=True)
-        path = SCREENSHOT_DIR / f"mercari_{label}_{int(time.time())}.png"
-        await page.screenshot(path=str(path), full_page=True)
-        logger.info("Screenshot saved: %s", path)
-    except Exception as e:
-        logger.warning("Could not save screenshot: %s", e)
-
-
 async def _list_on_mercari_async(item_id: int) -> str | None:
     item = db.get_item_by_id(item_id)
     if not item:
@@ -66,21 +61,14 @@ async def _list_on_mercari_async(item_id: int) -> str | None:
         return None
 
     async with async_playwright() as p:
-        try:
-            browser = await p.chromium.connect_over_cdp(CDP_URL)
-        except Exception as e:
-            logger.error("Cannot connect to Chrome on port 9222. %s", e)
-            logger.error("Start Chrome with: chrome.exe --remote-debugging-port=9222")
+        session = await ensure_mercari_alive(p)
+        if not session:
             return None
-
-        ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-
         try:
-            return await _do_mercari_listing(page, item, image_path)
+            return await _do_mercari_listing(session.page, item, image_path)
         except Exception as e:
             logger.error("Error listing item %d on Mercari: %s", item_id, e)
-            await _save_error_screenshot(page, f"error_{item_id}")
+            await failure_handler.save_failure_screenshot(session.page, "mercari", item.get("card_name", ""))
             return None
 
 
@@ -167,7 +155,7 @@ async def _do_mercari_listing(page, item, image_path: str) -> str | None:
             try:
                 w = page.locator(sel).first
                 if await w.is_visible(timeout=2000):
-                    await w.triple_click()
+                    await w.click(click_count=3)
                     await w.fill("1")
                     break
             except Exception:
@@ -208,7 +196,7 @@ async def _do_mercari_listing(page, item, image_path: str) -> str | None:
                         try:
                             fp = page.locator(fp_sel).first
                             if await fp.is_visible(timeout=2000):
-                                await fp.triple_click()
+                                await fp.click(click_count=3)
                                 await fp.fill(f"{FLOOR_PRICE:.2f}")
                                 break
                         except Exception:
@@ -248,6 +236,7 @@ async def _do_mercari_listing(page, item, image_path: str) -> str | None:
         logger.info("Mercari listing created: %s", mercari_id)
     else:
         logger.warning("Could not extract Mercari listing ID from: %s", page.url)
+        await failure_handler.save_failure_screenshot(page, "mercari", item.get("card_name", ""))
 
     return mercari_id
 

@@ -144,6 +144,14 @@ def get_all_items():
         return conn.execute("SELECT * FROM items ORDER BY created_at DESC").fetchall()
 
 
+def get_item_by_filename(filename: str):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM items WHERE filename = ? ORDER BY created_at DESC LIMIT 1",
+            (filename,),
+        ).fetchone()
+
+
 def get_item_by_platform_id(platform: str, platform_id: str):
     col = f"{platform}_id"
     with get_connection() as conn:
