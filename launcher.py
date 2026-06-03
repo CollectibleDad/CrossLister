@@ -288,6 +288,23 @@ def identify_and_price():
 
 def batch_list():
     """Option 5 — Batch Prep then list items on Mercari + Depop."""
+    import identifier as _identifier_mod
+
+    _launcher_path = Path(__file__).resolve()
+    _identifier_path = Path(_identifier_mod.__file__).resolve()
+    _launcher_mtime = datetime.fromtimestamp(_launcher_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    _identifier_mtime = datetime.fromtimestamp(_identifier_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    _has_new_parser = (
+        hasattr(_identifier_mod, "parse_pokemon_filename")
+        or hasattr(_identifier_mod, "_parse_pokemon_filename")
+    )
+    print("[RUNNING FILE] launcher.py")
+    print(f"[FULL PATH] {_launcher_path}")
+    print(f"[LAST MODIFIED] {_launcher_mtime}")
+    print(f"[POKEMON PARSER VERSION] {'NEW' if _has_new_parser else 'OLD'}")
+    print(f"[IDENTIFIER PATH] {_identifier_path}")
+    print(f"[IDENTIFIER LAST MODIFIED] {_identifier_mtime}")
+
     mercari_batch, depop_batch = batch_prep()
 
     import database as db

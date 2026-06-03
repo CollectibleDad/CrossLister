@@ -74,6 +74,8 @@ async def _list_on_mercari_async(item_id: int) -> str | None:
 
 async def _do_mercari_listing(page, item, image_path: str) -> str | None:
     logger.info("Listing '%s' on Mercari at $%.2f", item["title"], item["asking_price"])
+    print(f"[POKEMON LIVE RAW FILENAME] {item.get('filename', 'N/A')}")
+    print(f"[POKEMON LIVE PARSED DATA] card_name={item.get('card_name')!r} | set_name={item.get('set_name')!r} | rarity={item.get('rarity')!r} | condition={item.get('condition')!r} | card_type={item.get('card_type')!r}")
 
     await page.goto(MERCARI_SELL_URL, wait_until="domcontentloaded", timeout=90000)
     await asyncio.sleep(3)
@@ -87,23 +89,6 @@ async def _do_mercari_listing(page, item, image_path: str) -> str | None:
         logger.info("Photo uploaded.")
     except Exception as e:
         logger.warning("Photo upload: %s", e)
-
-    # ── Title ─────────────────────────────────────────────────────────────────
-    try:
-        t = page.locator('[data-testid="Title"]').first
-        await t.wait_for(state="visible", timeout=90000)
-        await t.fill(item["title"][:80])
-    except Exception as e:
-        logger.warning("Title: %s", e)
-
-    # ── Description ───────────────────────────────────────────────────────────
-    desc = _build_description(item)
-    try:
-        d = page.locator('[data-testid="Description"]').first
-        await d.wait_for(state="visible", timeout=90000)
-        await d.fill(desc)
-    except Exception as e:
-        logger.warning("Description: %s", e)
 
     # ── Category ──────────────────────────────────────────────────────────────
     try:
@@ -207,17 +192,105 @@ async def _do_mercari_listing(page, item, image_path: str) -> str | None:
     except Exception as e:
         logger.warning("Price: %s", e)
 
+    # ── Wait for form to settle after category/brand/condition ────────────────
+    await asyncio.sleep(2)
+
+    # ── Title (filled LAST to avoid form auto-refresh overwrite) ──────────────
+    pokemon_title = item["title"][:80]
+    pokemon_desc = _build_description(item)
+    print(f"[POKEMON LIVE TITLE TO FILL] {pokemon_title!r}")
+    print(f"[POKEMON LIVE DESCRIPTION TO FILL] {pokemon_desc!r}")
+
+    title_before = ""
+    try:
+        t = page.locator('[data-testid="Title"]').first
+        await t.wait_for(state="visible", timeout=90000)
+        title_before = await t.input_value()
+        print(f"[MERCARI TITLE BEFORE FILL] {title_before!r}")
+        await t.triple_click()
+        await t.fill(pokemon_title)
+        await asyncio.sleep(0.5)
+        title_after = await t.input_value()
+        print(f"[MERCARI TITLE AFTER FILL] {title_after!r}")
+    except Exception as e:
+        logger.warning("Title: %s", e)
+
+    # ── Description (filled LAST) ─────────────────────────────────────────────
+    try:
+        d = page.locator('[data-testid="Description"]').first
+        await d.wait_for(state="visible", timeout=90000)
+        await d.triple_click()
+        await d.fill(pokemon_desc)
+        await asyncio.sleep(0.5)
+        desc_after = await d.input_value()
+        print(f"[MERCARI DESCRIPTION AFTER FILL] {desc_after!r}")
+    except Exception as e:
+        logger.warning("Description: %s", e)
+
     await asyncio.sleep(1)
+
+    # ── Pre-submit verification ───────────────────────────────────────────────
+    title_before_submit = ""
+    desc_before_submit = ""
+    try:
+        title_before_submit = await page.locator('[data-testid="Title"]').first.input_value()
+    except Exception:
+        pass
+    try:
+        desc_before_submit = await page.locator('[data-testid="Description"]').first.input_value()
+    except Exception:
+        pass
+    print(f"[MERCARI TITLE BEFORE SUBMIT] {title_before_submit!r}")
+    print(f"[MERCARI DESCRIPTION BEFORE SUBMIT] {desc_before_submit!r}")
+
+    desc_word_count = len(desc_before_submit.split())
+    needs_refill = desc_word_count < 5 or title_before_submit.strip() in ("", "Near Mint")
+    if needs_refill:
+        logger.warning(
+            "Pre-submit fields stale (title=%r, desc_words=%d) — refilling",
+            title_before_submit[:60], desc_word_count,
+        )
+        try:
+            t = page.locator('[data-testid="Title"]').first
+            await t.triple_click()
+            await t.fill(pokemon_title)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning("Refill title: %s", e)
+        try:
+            d = page.locator('[data-testid="Description"]').first
+            await d.triple_click()
+            await d.fill(pokemon_desc)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning("Refill description: %s", e)
+        try:
+            desc_before_submit = await page.locator('[data-testid="Description"]').first.input_value()
+        except Exception:
+            desc_before_submit = pokemon_desc
+        desc_word_count = len(desc_before_submit.split())
+        print(f"[MERCARI TITLE BEFORE SUBMIT] {await page.locator('[data-testid=\"Title\"]').first.input_value()!r} (after refill)")
+        print(f"[MERCARI DESCRIPTION BEFORE SUBMIT] {desc_before_submit!r} (after refill)")
+
+    if desc_word_count < 5:
+        print("[MERCARI DESCRIPTION TOO SHORT - NOT LISTED]")
+        logger.error("[MERCARI DESCRIPTION TOO SHORT - NOT LISTED] desc=%r", desc_before_submit)
+        return None
 
     # ── Submit ────────────────────────────────────────────────────────────────
     try:
         list_btn = page.locator('[data-testid="ListButton"]:not([disabled])').first
         await list_btn.wait_for(state="visible", timeout=90000)
         await list_btn.click()
-        await asyncio.sleep(4)
         logger.info("Submit clicked.")
     except Exception as e:
         logger.warning("Submit (button may still be disabled — check required fields): %s", e)
+
+    # Wait for Mercari to redirect to the actual listing page
+    try:
+        await page.wait_for_url(lambda url: "/item/" in url, timeout=20000)
+    except Exception:
+        pass
 
     # Dismiss confirmation modal if any
     for txt in ["Confirm", "OK", "Done", "Got it"]:
@@ -230,12 +303,18 @@ async def _do_mercari_listing(page, item, image_path: str) -> str | None:
         except Exception:
             pass
 
-    mercari_id = _extract_listing_id(page.url)
+    final_url = page.url
+    if "/item/" not in final_url:
+        logger.warning("Mercari did not reach listing page — submit failed. URL: %s", final_url)
+        await failure_handler.save_failure_screenshot(page, "mercari", item.get("card_name", ""))
+        return None
+
+    mercari_id = _extract_listing_id(final_url)
     if mercari_id:
         db.update_item(item["id"], {"mercari_id": mercari_id, "status": "active"})
         logger.info("Mercari listing created: %s", mercari_id)
     else:
-        logger.warning("Could not extract Mercari listing ID from: %s", page.url)
+        logger.warning("Could not extract Mercari listing ID from: %s", final_url)
         await failure_handler.save_failure_screenshot(page, "mercari", item.get("card_name", ""))
 
     return mercari_id
@@ -279,7 +358,11 @@ async def _select_category(page):
 
 
 def _build_description(item) -> str:
-    parts = [f"{item['card_name']} - {item['condition']}"]
+    condition = item.get("condition", "Near Mint")
+    if item.get("card_type") == "Pokemon":
+        title = item.get("title", "").strip()
+        return f"{title} Pokemon trading card. Condition: {condition}."
+    parts = [f"{item['card_name']} - {condition}"]
     if item.get("set_name"):
         parts.append(f"Set: {item['set_name']}")
     if item.get("card_number"):

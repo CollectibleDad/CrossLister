@@ -132,6 +132,7 @@ async def _list_on_depop_async(item_id: int) -> str | None:
 async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
     logger.info("Listing '%s' on Depop at $%s", item["title"], DEPOP_FIXED_PRICE)
     title = item["title"][:60]
+    print(f"[DEPOP POKEMON LIVE TITLE TO FILL] {title!r}")
     _goto_timeout = 180_000 if LONG_RUN_MODE else _GOTO_TIMEOUT_MS
     _idle_timeout = 15_000 if LONG_RUN_MODE else 8_000
 
@@ -256,6 +257,7 @@ async def _do_depop_listing(page: Page, item: dict, image_path: str) -> bool:
     # ── Description ───────────────────────────────────────────────────────────
     await close_blocking_modals(page)
     desc = _build_description(item)
+    print(f"[DEPOP POKEMON LIVE DESCRIPTION TO FILL] {desc!r}")
     filled = False
     for attempt in [
         lambda: page.get_by_label(re.compile(r"description", re.I)),
